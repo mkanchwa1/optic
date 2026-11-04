@@ -40,6 +40,13 @@ enum Cmd {
         #[arg(long)] patch: PathBuf,
         #[arg(long)] out: PathBuf,
     },
+    /// Batch inference over a labeled cohort (model loaded once).
+    /// LABELS is a TSV: path <TAB> kind(bam|pileup|beta) <TAB> label.
+    /// Emits one JSON object per case (JSON Lines) on stdout.
+    Eval {
+        #[arg(long)] labels: PathBuf,
+        #[arg(short, long, default_value_t = 8)] threads: usize,
+    },
     /// Federated update: one backward pass over a labeled cohort.
     /// LABELS is a TSV: path <TAB> kind(bam|pileup|beta) <TAB> label
     Contribute {
@@ -106,6 +113,25 @@ fn main() -> Result<()> {
                 grad_norm: fed::grad_norm(&grads)? };
             fed::write_update(out, &grads, &meta)?;
             eprintln!("contribute: {} samples, mean loss {:.4}, |grad| {:.3} -> {} (+ .json)", meta.n_samples, loss, meta.grad_norm, out.display());
+            return Ok(());
+        }
+        Cmd::Eval { labels, threads } => {
+            let names = model.class_names(&model.head).unwrap_or(&[]);
+            for (i, line) in std::fs::read_to_string(labels)?.lines().enumerate() {
+                if line.trim().is_empty() || line.starts_with('#') { continue; }
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 3 { anyhow::bail!("labels line {}: expected path<TAB>kind<TAB>label", i + 1); }
+                let cgs = load_sample(f[1], std::path::Path::new(f[0]), &bed, *threads, bam::DEFAULT_THRESHOLD_LOW, bam::DEFAULT_THRESHOLD_HIGH)?;
+                let (ternary, _) = probes.cgs_to_ternary(&cgs);
+                let pred = net.infer(&ternary, &device)?;
+                let rep = report::build(&model, &pred);
+                let probs = pred.probs.iter().find(|(h, _)| *h == model.head).map(|(_, p)| p.as_slice()).unwrap_or(&[]);
+                println!("{}", serde_json::json!({
+                    "path": f[0], "label": f[2], "n_covered": pred.n_covered,
+                    "report": rep,
+                    "classes": names.iter().zip(probs).map(|(n, &q)| serde_json::json!({"class": n, "probability": q})).collect::<Vec<_>>(),
+                }));
+            }
             return Ok(());
         }
         Cmd::Apply { patch, out } => { return fed::apply(&model, patch, out, &device); }
